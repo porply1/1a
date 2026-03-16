@@ -1,0 +1,198 @@
+# =============================================================================
+# 军火库竞赛配置模板 (configs/template.yaml)
+# 使用方法: python scripts/train_pipeline.py --config configs/template.yaml
+# =============================================================================
+
+# ------------------------------------------------------------
+# 实验元信息
+# ------------------------------------------------------------
+experiment:
+  name: "my_competition_v1"       # 实验名称（写入 report.json 和目录名）
+  task: "binary"                  # 任务类型: binary | multiclass | regression
+  seed: 42
+  description: "baseline with LGBM+XGB stacking"
+
+# ------------------------------------------------------------
+# 数据配置
+# ------------------------------------------------------------
+data:
+  train_path: "data/train.csv"    # 支持 .csv / .parquet / .feather
+  test_path:  "data/test.csv"
+  target_col: "target"            # 标签列名
+  id_col:     "id"                # 提交文件 ID 列（可选，null 表示用行索引）
+  parse_dates: []                 # 需要解析为 datetime 的列，如 ["date"]
+  drop_cols:   []                 # 加载后立即删除的列
+
+# ------------------------------------------------------------
+# 交叉验证配置
+# ------------------------------------------------------------
+cv:
+  strategy: "stratified_kfold"   # 可选：kfold | stratified_kfold |
+                                 #        group_kfold | stratified_group_kfold |
+                                 #        timeseries | purged_timeseries |
+                                 #        user_group_kfold
+  n_splits: 5
+  shuffle:  true
+  random_state: 42
+  gap: 0                         # 时序切分专用：train/val 间隔
+  group_col: null                # GroupKFold 专用：分组列名
+
+# ------------------------------------------------------------
+# 特征工程配置
+# ------------------------------------------------------------
+features:
+  enable: true
+  use_oof_transform: true        # true → fit_transform_oof（防泄露）
+                                 # false → 普通 fit_transform
+
+  transformers:
+    # --- 时序特征 ---
+    - type: TimeFeatureTransformer
+      enabled: true
+      params:
+        date_col: "date"
+        cyclic: ["month", "dayofweek", "hour"]
+
+    # --- GroupBy 聚合特征 ---
+    - type: GroupAggTransformer
+      enabled: true
+      params:
+        group_keys: [["store_id"], ["store_id", "item_id"]]
+        agg_cols: "sales"
+        agg_funcs: ["mean", "std", "max", "min", "median"]
+
+    # --- 差分特征 ---
+    - type: DiffTransformer
+      enabled: true
+      params:
+        value_cols: ["sales"]
+        diff_periods: [1, 7, 28]
+        rolling_windows: [7, 14, 28]
+        rolling_funcs: ["mean", "std"]
+        group_by: "item_id"
+        sort_by: "date"
+
+    # --- Lag 特征 ---
+    - type: LagTransformer
+      enabled: true
+      params:
+        value_cols: ["sales"]
+        lags: [1, 7, 14, 28]
+        group_by: "item_id"
+        sort_by: "date"
+
+    # --- 目标编码（强制折内防泄露）---
+    - type: TargetEncoderTransformer
+      enabled: false             # 结构化任务时开启
+      params:
+        cat_cols: ["store_id", "item_id", "dept_id"]
+        smoothing: 20.0
+
+    # --- 频率编码 ---
+    - type: FreqEncoderTransformer
+      enabled: false
+      params:
+        cat_cols: ["store_id", "item_id"]
+
+# ------------------------------------------------------------
+# 模型配置（支持多模型，可任意增减）
+# ------------------------------------------------------------
+models:
+  # --- LightGBM ---
+  - name: "lgbm"
+    type: "LGBMModel"
+    enabled: true
+    num_boost_round: 1000
+    early_stopping_rounds: 100
+    log_period: 200
+    fi_type: "gain"
+    params:
+      num_leaves: 63
+      learning_rate: 0.05
+      feature_fraction: 0.8
+      bagging_fraction: 0.8
+      bagging_freq: 1
+      lambda_l1: 0.1
+      lambda_l2: 0.1
+      min_child_samples: 20
+
+  # --- XGBoost ---
+  - name: "xgb"
+    type: "XGBModel"
+    enabled: true
+    num_boost_round: 1000
+    early_stopping_rounds: 100
+    log_period: 200
+    fi_type: "total_gain"
+    params:
+      max_depth: 6
+      eta: 0.05
+      subsample: 0.8
+      colsample_bytree: 0.8
+      alpha: 0.1
+      lambda: 1.0
+      tree_method: "hist"
+
+  # --- CatBoost ---
+  - name: "catboost"
+    type: "CatBoostModel"
+    enabled: true
+    iterations: 1000
+    early_stopping_rounds: 100
+    log_period: 200
+    fi_type: "LossFunctionChange"
+    params:
+      depth: 6
+      learning_rate: 0.05
+      l2_leaf_reg: 3.0
+      rsm: 0.8
+      subsample: 0.8
+
+# ------------------------------------------------------------
+# 超参数搜索配置（可选）
+# ------------------------------------------------------------
+tuning:
+  enable: false                  # 开启后在正式训练前自动调参
+  n_trials: 50
+  timeout: 3600                  # 最长搜索秒数（null = 不限时）
+  sampler: "tpe"
+  pruner: "median"
+  storage: null                  # "sqlite:///outputs/tuning.db" 开启持久化
+  fit_best_at_end: false         # true → 调参后直接用最优参数做完整CV
+  models_to_tune: ["lgbm"]       # 只对指定模型调参
+
+# ------------------------------------------------------------
+# 集成配置
+# ------------------------------------------------------------
+ensemble:
+  enable: true
+  method: "stacking"             # stacking | blending（暂只实现 stacking）
+  task: "binary"
+  scale_meta_features: true
+  passthrough: false             # true → 将原始特征追加到元特征矩阵
+
+# ------------------------------------------------------------
+# 评估指标配置
+# ------------------------------------------------------------
+metrics:
+  primary:
+    name: "auc"
+    func: "roc_auc_score"        # sklearn.metrics 中的函数名
+    higher_is_better: true
+    use_proba: true
+  secondary:
+    - name: "logloss"
+      func: "log_loss"
+      higher_is_better: false
+      use_proba: true
+
+# ------------------------------------------------------------
+# 输出配置
+# ------------------------------------------------------------
+output:
+  base_dir: "outputs"
+  save_models: true
+  save_oof: true
+  save_feature_importance: true
+  save_submission: true
+  submission_col: "target"       # 提交文件的预测列名
