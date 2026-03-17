@@ -13,6 +13,12 @@
 3. [快速上手](#3-快速上手)
 4. [YAML 配置完全指南](#4-yaml-配置完全指南)
 5. [深度学习模型接入](#5-深度学习模型接入)
+   - 5.1 环境准备
+   - 5.2 DeepFM
+   - 5.3 DIN
+   - 5.4 ESMM
+   - 5.5 Two-Tower
+   - **5.6 PLE（推荐系统 2025 顶配）**
 6. [进阶实战建议](#6-进阶实战建议)
 7. [开发者扩展手册](#7-开发者扩展手册)
 8. [常见问题 FAQ](#8-常见问题-faq)
@@ -39,7 +45,7 @@ kaggle-arsenal/
 │
 ├── models/             ★ 武器库
 │   ├── gbm/                GBM 三剑客（LGBM / XGB / CatBoost）
-│   └── deep/               深度学习四件套（DeepFM / DIN / TwoTower / ESMM）
+│   └── deep/               深度学习五件套（DeepFM / DIN / TwoTower / ESMM / PLE）
 │
 ├── ensemble/           ★ 集成层：决赛核武器
 │   └── stacking.py         StackingEnsemble（OOF 驱动元学习）
@@ -620,6 +626,160 @@ distances, indices = index.search(user_embs, k=100)
 
 ---
 
+### 5.6 PLE — 多任务学习（推荐系统 2025 顶配）
+
+PLE（Progressive Layered Extraction）是腾讯 RecSys 2020 论文提出的架构，已成为 2021–2025 年工业界多目标推荐的事实标准，大幅替代 ESMM 和 MMOE。
+
+#### 为什么要用 PLE 而不是 ESMM？
+
+| 特性 | ESMM | MMOE | **PLE** |
+|---|---|---|---|
+| 专家类型 | 无（共享 Embedding 底层）| 仅共享专家 | **专用 + 共享双路** |
+| 多层渐进提取 | 否 | 否 | **是（n_levels 层）** |
+| 跷跷板效应风险 | 高 | 中 | **低** |
+| 样本偏差修正 | ✅ pCTCVR | ❌ | ✅ pCTCVR |
+| 竞赛冠军方案 | 2019 | 2020 | **2021–2025** |
+
+> **跷跷板效应**：在 MMOE 中，若两个任务存在负迁移（例如点击偏好与购买偏好冲突），门控网络会"抢占"共享专家，导致一个任务提升时另一个恶化。PLE 为每个任务保留专用专家，从根本上缓解了这一问题。
+
+#### 架构图
+
+```
+输入特征（Embedding + Dense 拼接）
+         │
+    ┌────┴─────────────────────────┐
+    │  Level 1                     │
+    │  CTR 专用专家 × n_specific    │
+    │  CVR 专用专家 × n_specific    │
+    │  共享专家     × n_shared      │
+    │         │                    │
+    │  CTR Gate → h_ctr¹           │
+    │  CVR Gate → h_cvr¹           │
+    │  Shared Gate → h_s¹  ←仅中间层│
+    └──────────────────────────────┘
+         │（以门控输出为下一层输入）
+    ┌────┴─────────────────────────┐
+    │  Level 2（最终层无 Shared Gate）│
+    │  同上结构                    │
+    │  CTR Gate → h_ctr²           │
+    │  CVR Gate → h_cvr²           │
+    └──────────────────────────────┘
+         │
+    CTR Tower DNN → sigmoid → pCTR
+    CVR Tower DNN → sigmoid → pCVR
+         │
+    pCTCVR = pCTR × pCVR
+```
+
+#### 标签准备（与 ESMM 完全相同）
+
+```python
+# label_click:      曝光后是否点击（全量样本都有，0/1）
+# label_conversion: 曝光后是否最终购买（= 全空间转化标签，非点击后标签）
+df["label_click"]      = (df["action"] >= 1).astype(int)
+df["label_conversion"] = (df["action"] == 2).astype(int)  # 点击且购买
+```
+
+#### YAML 配置
+
+```yaml
+models:
+  - name: "ple"
+    type: "PLEModel"
+    enabled: true
+    params:
+      # ── PLE 核心架构 ───────────────────────────────────
+      n_levels: 2           # 提取层数：1层=MMOE；2~3层是竞赛最佳实践
+      n_specific: 2         # 每任务专用专家数（建议 2~4）
+      n_shared: 2           # 共享专家数（建议 ≥ n_specific）
+      expert_units: [128, 64]
+      expert_activation: "relu"
+      expert_dropout: 0.0
+
+      # ── 任务塔 ─────────────────────────────────────────
+      tower_units: [64, 32]
+      tower_dropout: 0.1
+
+      # ── 多目标损失权重 ─────────────────────────────────
+      ctr_loss_weight: 1.0   # w₁·BCE(pCTR, y_click)
+      cvr_loss_weight: 1.0   # w₂·BCE(pCTCVR, y_conv)
+
+      # ── 标签列名 ───────────────────────────────────────
+      label_click: "label_click"
+      label_conversion: "label_conversion"
+
+      # ── 通用训练参数 ───────────────────────────────────
+      embedding_dim: 8
+      learning_rate: 0.001
+      batch_size: 4096
+      epochs: 50
+      patience: 5
+      device: "auto"
+```
+
+#### 三种预测接口
+
+```python
+from models.deep.ple_wrapper import PLEModel
+
+model = PLEModel(task="binary", seed=42)
+model.fit(X_train, y_train)        # 标签自动从 X_train 中的标签列提取
+
+# 默认接口（进 Stacking / CrossValidatorTrainer）
+p_ctcvr = model.predict_proba(X_test)    # shape=(N,)，pCTCVR
+
+# 分拆接口（分析各任务贡献）
+p_ctr = model.predict_ctr(X_test)        # 点击率
+p_cvr = model.predict_cvr(X_test)        # 转化率（= pCTCVR / (pCTR + ε)）
+
+# 全量输出（DataFrame，适合多目标融合排序）
+scores = model.predict_all(X_test)
+# scores.columns: ["pCTR", "pCVR", "pCTCVR"]
+
+# 多目标线性融合（调整权重即可实现不同业务目标）
+scores["rank_score"] = 0.3 * scores["pCTR"] + 0.7 * scores["pCVR"]
+```
+
+#### Optuna 自动调参（搜索 PLE 专属参数）
+
+```yaml
+tuning:
+  enable: true
+  n_trials: 80
+  models_to_tune: ["ple"]
+```
+
+```
+自动搜索空间（suggest_params）：
+  n_levels        : 1 ~ 3
+  n_specific      : 1 ~ 4
+  n_shared        : 1 ~ 4
+  expert_dim      : 32 / 64 / 128 / 256
+  n_expert_layers : 1 ~ 3
+  tower_dim       : 32 / 64 / 128
+  ctr_loss_weight : 0.3 ~ 2.0
+  cvr_loss_weight : 0.3 ~ 2.0
+  embedding_dim   : 4 / 8 / 16 / 32
+  learning_rate   : 1e-4 ~ 1e-2 (log)
+```
+
+#### PLE + LightGBM Stacking 示例（推荐赛道 2025 标配方案）
+
+```yaml
+# configs/recsys_ple.yaml
+models:
+  - {name: lgbm, type: LGBMModel,   enabled: true, params: {num_leaves: 63}}
+  - {name: ple,  type: PLEModel,    enabled: true,
+     params: {n_levels: 2, n_specific: 2, n_shared: 2, label_click: is_click,
+              label_conversion: is_buy}}
+
+ensemble:
+  enable: true
+  method: "stacking"
+```
+
+---
+
 ## 6. 进阶实战建议
 
 ### 6.1 大规模 Optuna 超参搜索
@@ -1065,7 +1225,8 @@ python scripts/train_pipeline.py \
 | 结构化分类 | LightGBM | XGBoost + CatBoost | 三模型 Stacking |
 | 结构化回归 | LightGBM | CatBoost | 均值融合 |
 | CTR 预估 | DeepFM + LightGBM | DIN | Stacking |
-| 多目标 (CTR+CVR) | ESMM | ESMM + LightGBM | Stacking |
+| 多目标 (CTR+CVR) | **PLE** | PLE + LightGBM | Stacking |
+| 多目标（旧方案备选）| ESMM | ESMM + LightGBM | Stacking |
 | 大规模召回 | TwoTower + Faiss | — | ANN 检索 |
 | 用户兴趣建模 | DIN | DIN + LightGBM | Stacking |
 | 时序预测 | LightGBM + Lag 特征 | N-HiTS | 均值融合 |
@@ -1082,6 +1243,11 @@ python scripts/train_pipeline.py \
 | DeepFM | `embedding_dim` | [4, 8, 16, 32] |
 | DeepFM | `learning_rate` | [1e-4, 1e-2] (log) |
 | ESMM | `ctr_loss_weight` | [0.5, 2.0] |
+| **PLE** | `n_levels` | [1, 3] |
+| **PLE** | `n_specific` | [1, 4] |
+| **PLE** | `n_shared` | [1, 4] |
+| **PLE** | `ctr_loss_weight` | [0.3, 2.0] |
+| **PLE** | `cvr_loss_weight` | [0.3, 2.0] |
 | TwoTower | `temperature` | [0.01, 0.2] (log) |
 
 ---

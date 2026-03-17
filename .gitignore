@@ -1,4 +1,17 @@
-data/ 
-outputs/ 
-__pycache__/ 
-*.db 
+# 数据与模型（严禁上传）
+data/*.csv
+data/*.parquet
+data/*.feather
+outputs/
+models/checkpoint/
+
+# Python 缓存
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# 环境与 IDE
+.vscode/
+.idea/
+venv/
+.env

@@ -1,0 +1,24 @@
+# Python >= 3.9
+
+# Core
+numpy>=1.24
+pandas>=2.0
+psutil>=5.9
+
+# Machine Learning
+scikit-learn>=1.3
+
+# Gradient Boosting Models
+lightgbm>=4.0
+xgboost>=2.0
+catboost>=1.2
+
+# Hyperparameter Optimization
+optuna>=3.4
+
+# Deep Learning
+torch>=2.0
+deepctr-torch>=0.9
+
+# Configuration
+PyYAML>=6.0

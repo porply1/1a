@@ -148,6 +148,50 @@ models:
       rsm: 0.8
       subsample: 0.8
 
+  # --- BST（推荐：行为序列 Transformer）---
+  # - name: "bst"
+  #   type: "BSTModel"
+  #   enabled: false
+  #   seq_configs:
+  #     - seq_col:     hist_item_id_list
+  #       target_col:  item_id
+  #       timegap_col: hist_timegap_list   # 可选
+  #       maxlen:      50
+  #   params:
+  #     d_model: 64
+  #     head_num: 4
+  #     n_transformer_layers: 2
+  #     hidden_size: 256
+  #     dropout: 0.1
+  #     batch_size: 2048
+  #     patience: 5
+  #   # ── 动态负采样（深度模型专属，BST / PLE 均支持）──────────────
+  #   negative_sampling:
+  #     enable:      false       # true → 每 Epoch 重采样负例
+  #     neg_ratio:   4           # 正:负 ≈ 1:4（建议 2~10）
+  #     buffer_size: 3           # 后台预取 Epoch 数（建议 2~5）
+  #     n_workers:   1           # 后台采样线程数
+  #     seed:        42
+
+  # --- PLE（推荐：多任务 CTR/CVR）---
+  # - name: "ple"
+  #   type: "PLEModel"
+  #   enabled: false
+  #   params:
+  #     n_levels: 2
+  #     n_specific: 2
+  #     n_shared: 2
+  #     expert_units: [256, 128]
+  #     tower_units:  [128, 64]
+  #     batch_size:   2048
+  #     patience:     5
+  #   negative_sampling:
+  #     enable:      false
+  #     neg_ratio:   4
+  #     buffer_size: 3
+  #     n_workers:   1
+  #     seed:        42
+
 # ------------------------------------------------------------
 # 超参数搜索配置（可选）
 # ------------------------------------------------------------
@@ -166,10 +210,23 @@ tuning:
 # ------------------------------------------------------------
 ensemble:
   enable: true
-  method: "stacking"             # stacking | blending（暂只实现 stacking）
+  method: "stacking"             # stacking（默认）| hill_climbing
   task: "binary"
   scale_meta_features: true
   passthrough: false             # true → 将原始特征追加到元特征矩阵
+  clip_oof: false                # true → 对 OOF 做 1/99 百分位截断
+
+  # ── Hill Climbing（Caruana Ensemble Selection）─────────────
+  # 仅 method: "hill_climbing" 时生效；stacking 时可整块删除
+  hill_climbing:
+    n_iterations:        100     # 贪心迭代总轮数 T（建议 50~500）
+    higher_is_better:    true    # True=最大化指标（AUC/Accuracy）；False=最小化（RMSE）
+    random_shuffle_pct:  0.05    # 每轮随机扰动概率，防局部最优（0.0~0.1）
+    n_bags:              5       # Bootstrap 袋数（别名：bagging_runs，二者等效）
+    # bagging_runs:      5       # ← 与 n_bags 完全等效的语义别名
+    bag_fraction:        1.0     # 每袋采样比例（有放回），1.0 = 全量
+    seed:                42
+    warm_start_with_best: true   # True → 以最优单模型为冷启动起点
 
 # ------------------------------------------------------------
 # 评估指标配置
@@ -185,6 +242,35 @@ metrics:
       func: "log_loss"
       higher_is_better: false
       use_proba: true
+
+# ------------------------------------------------------------
+# 对抗性验证配置（Step 1.5，在数据加载后、特征工程前执行）
+# ------------------------------------------------------------
+adversarial_validation:
+  enable: false                    # true → 自动在数据加载后执行
+
+  # ── 判定阈值 ─────────────────────────────────────────────
+  auc_threshold: 0.70              # 全特征 AUC 超过此值 → 判定存在分布偏移
+  drop_threshold_auc: 0.65         # Stage 2：单特征 AUC 超过此值 → 建议剔除
+
+  # ── 验证规模 ─────────────────────────────────────────────
+  n_splits: 5                      # 对抗模型 CV 折数
+  n_top_features: 30               # Stage 2 最多分析的可疑特征数
+
+  # ── Stage 2：单特征精准诊断（慢，但更准确）──────────────
+  compute_per_feature_auc: false   # true → 对 Top-N 特征逐一计算 AUC
+  drop_threshold_importance: 0.01  # 归一化重要性 >= 此值才进入 Stage 2 分析
+
+  # ── 剔除行为 ─────────────────────────────────────────────
+  auto_drop: false                 # true → pipeline 自动剔除建议列
+                                   # false → 仅输出报告，手动决定是否剔除
+
+  # ── 排除列（ID 列、时间戳列等不应参与验证）──────────────
+  ignore_cols: []                  # 示例: ["id", "date", "user_id"]
+
+  # ── 覆盖 LightGBM 对抗模型参数（一般无需修改）──────────
+  lgbm_params: {}
+  seed: 42
 
 # ------------------------------------------------------------
 # 输出配置

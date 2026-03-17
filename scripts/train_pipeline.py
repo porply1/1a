@@ -62,6 +62,12 @@ import sklearn.metrics as skm
 
 from data.loader    import DataLoader
 from data.splitter  import BaseCVSplitter, CVConfig, get_cv
+from data.adversarial_validation import (
+    AdversarialValidator,
+    AdvConfig,
+    run_adversarial_validation,
+)
+from data.negative_sampler import NegativeSamplerConfig
 from core.base_model   import BaseModel
 from core.base_trainer import CrossValidatorTrainer, MetricConfig, CVResult
 from features.engine   import (
@@ -82,12 +88,14 @@ try:
     from models.deep.din_wrapper       import DINModel, SeqFeatureConfig
     from models.deep.two_tower_wrapper import TwoTowerModel
     from models.deep.esmm_wrapper      import ESMMModel
+    from models.deep.ple_wrapper       import PLEModel
+    from models.deep.bst_wrapper       import BSTModel, BSTSeqConfig
     _DEEP_MODELS_AVAILABLE = True
 except ImportError as _deep_err:
     _DEEP_MODELS_AVAILABLE = False
     _DEEP_IMPORT_ERROR     = str(_deep_err)
 
-from ensemble.stacking            import StackingEnsemble, StackingConfig
+from ensemble.stacking            import StackingEnsemble, StackingConfig, HillClimbingConfig
 from optimization.optuna_tuner    import OptunaTuner, TunerConfig
 from utils.memory                 import memory_monitor
 
@@ -110,13 +118,15 @@ if _DEEP_MODELS_AVAILABLE:
         "DINModel":       DINModel,
         "TwoTowerModel":  TwoTowerModel,
         "ESMMModel":      ESMMModel,
+        "PLEModel":       PLEModel,
+        "BSTModel":       BSTModel,
     })
 else:
     # 首次加载时打印一次警告，之后通过 _warn_deep_unavailable 按需触发
     import warnings as _w
     _w.warn(
         f"深度学习模型不可用（torch/deepctr-torch 未安装）：{_DEEP_IMPORT_ERROR}\n"
-        "如需使用 DeepFM/DIN/TwoTower/ESMM，请执行：\n"
+        "如需使用 DeepFM/DIN/TwoTower/ESMM/PLE，请执行：\n"
         "  pip install torch deepctr-torch",
         ImportWarning,
         stacklevel=2,
@@ -225,7 +235,7 @@ def _build_model(model_cfg: dict, task: str, seed: int) -> BaseModel:
     cls_name = model_cfg["type"]
     if cls_name not in _MODEL_REGISTRY:
         # 深度模型被配置但环境不支持时给出明确错误
-        _deep_names = {"DeepFMModel", "DINModel", "TwoTowerModel", "ESMMModel"}
+        _deep_names = {"DeepFMModel", "DINModel", "TwoTowerModel", "ESMMModel", "PLEModel", "BSTModel"}
         if cls_name in _deep_names and not _DEEP_MODELS_AVAILABLE:
             raise RuntimeError(
                 f"模型 '{cls_name}' 需要 PyTorch 和 DeepCTR-Torch，但当前环境不可用。\n"
@@ -301,6 +311,20 @@ def _build_model(model_cfg: dict, task: str, seed: int) -> BaseModel:
 
     # ESMMModel 无额外必填参数，label_click/label_conversion 列名
     # 通过 params 传入（已在 ESMMParams 中有默认值）。
+
+    elif cls_name == "BSTModel":
+        # BST 专属：序列特征配置（与 DINModel 格式完全一致）
+        # 示例 YAML：
+        #   seq_configs:
+        #     - seq_col:     hist_item_id_list
+        #       target_col:  item_id
+        #       timegap_col: hist_timegap_list   # 可选
+        #       maxlen:      50
+        raw_seq = model_cfg.get("seq_configs") or []
+        kwargs["seq_configs"] = [
+            BSTSeqConfig(**c) if isinstance(c, dict) else c
+            for c in raw_seq
+        ]
 
     return cls(**kwargs)
 
@@ -412,6 +436,8 @@ class TrainPipeline:
             "ensemble":    {},
             "timing":      {},
         }
+        # 存储 Step 1.5 的 AV AUC，供 Step 3.5 二阶对比使用
+        self._pre_fe_av_auc: Optional[float] = None
 
     # ------------------------------------------------------------------
     # 主入口
@@ -424,6 +450,9 @@ class TrainPipeline:
 
         # ── Step 1: 加载数据 ───────────────────────────────────────────
         train_df, test_df, y, test_ids = self._step_load_data()
+
+        # ── Step 1.5: 对抗性验证（可选）──────────────────────────────
+        train_df, test_df = self._step_adversarial_validation(train_df, test_df, y)
 
         # ── Step 2: 构建 CV ────────────────────────────────────────────
         cv, group_col = _build_cv(cfg["cv"])
@@ -439,6 +468,9 @@ class TrainPipeline:
         X_train, X_test = self._step_feature_engineering(
             X_raw, y, X_test_raw, cv, groups
         )
+
+        # ── Step 3.5: 特征工程后二阶对抗验证 ─────────────────────────
+        self._step_adversarial_validation_post_fe(X_train, X_test)
 
         # ── Step 4: 构建指标 ───────────────────────────────────────────
         primary_metric, all_metrics = self._build_metrics()
@@ -531,6 +563,187 @@ class TrainPipeline:
         return train_df, test_df, y, test_ids
 
     # ------------------------------------------------------------------
+    # Step 1.5: 对抗性验证
+    # ------------------------------------------------------------------
+
+    def _step_adversarial_validation(
+        self,
+        train_df: pd.DataFrame,
+        test_df:  Optional[pd.DataFrame],
+        y:        pd.Series,
+    ) -> tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+        """
+        对抗性验证入口。
+
+        执行时机：数据加载后、特征工程前。
+        行为：
+          - config.adversarial_validation.enable=False → 直接透传，零开销
+          - enable=True，auto_drop=False              → 打印报告，不修改数据
+          - enable=True，auto_drop=True               → 自动剔除建议列，返回干净数据
+        """
+        adv_cfg_dict = self.cfg.get("adversarial_validation", {})
+        if not adv_cfg_dict.get("enable", False):
+            return train_df, test_df
+        if test_df is None:
+            self.logger.warning(
+                "[adversarial] 未提供测试集（test_path=null），跳过对抗验证。"
+            )
+            return train_df, test_df
+
+        adv_cfg = AdvConfig.from_dict(adv_cfg_dict)
+        cfg_data = self.cfg["data"]
+
+        # 从 train_df 中去除标签列，得到纯特征 DataFrame
+        target_col = cfg_data["target_col"]
+        id_col     = cfg_data.get("id_col")
+        group_col  = self.cfg.get("cv", {}).get("group_col")
+
+        meta_cols  = [c for c in [target_col, id_col, group_col]
+                      if c and c in train_df.columns]
+        X_tr_feat  = train_df.drop(columns=meta_cols)
+        X_te_feat  = test_df.drop(
+            columns=[c for c in [id_col] if c and c in test_df.columns],
+            errors="ignore",
+        )
+
+        # 合并 ignore_cols：用户配置 + 自动识别的元列
+        auto_ignore = [c for c in meta_cols if c in X_tr_feat.columns]
+        adv_cfg.ignore_cols = list(
+            set(adv_cfg.ignore_cols) | set(auto_ignore)
+        )
+
+        result = run_adversarial_validation(
+            X_train  = X_tr_feat,
+            X_test   = X_te_feat,
+            config   = adv_cfg,
+            save_dir = str(self.exp_dir),
+        )
+
+        if result is None:
+            return train_df, test_df
+
+        # 写入 report
+        self.report["adversarial_validation"] = {
+            "overall_auc":         result.overall_auc,
+            "distribution_shift":  result.distribution_shift,
+            "suggested_drop_cols": result.suggested_drop_cols,
+            "elapsed_s":           round(result.elapsed_seconds, 1),
+        }
+        # 缓存供 Step 3.5 二阶对比
+        self._pre_fe_av_auc = result.overall_auc
+
+        self.logger.info(result.report())
+
+        if adv_cfg.auto_drop and result.suggested_drop_cols:
+            train_df, test_df = AdversarialValidator.apply_drop(
+                train_df, test_df, result
+            )
+            self.logger.info(
+                f"[adversarial] auto_drop=True | "
+                f"已从训练集和测试集删除 {len(result.suggested_drop_cols)} 列"
+            )
+
+        return train_df, test_df
+
+    # ------------------------------------------------------------------
+    # Step 3.5: 二阶对抗验证（特征工程后）
+    # ------------------------------------------------------------------
+
+    def _step_adversarial_validation_post_fe(
+        self,
+        X_train: pd.DataFrame,
+        X_test:  Optional[pd.DataFrame],
+    ) -> None:
+        """
+        在特征工程结束后再次执行对抗验证。
+
+        逻辑：
+          - adversarial_validation.enable=False → 静默跳过
+          - X_test 为 None → 跳过
+          - _pre_fe_av_auc 未设置（Step 1.5 未运行） → 跳过
+          - post_FE_AUC - pre_FE_AUC > 0.05 → ⚠ 强制打印 Top-5 漂移特征
+            并建议指挥官检查特征逻辑
+        """
+        adv_cfg_dict = self.cfg.get("adversarial_validation", {})
+        if not adv_cfg_dict.get("enable", False):
+            return
+        if X_test is None:
+            return
+        if self._pre_fe_av_auc is None:
+            return
+
+        self._banner("Step 3.5 / 7  二阶对抗验证（特征工程后）")
+        t0 = time.perf_counter()
+
+        adv_cfg          = AdvConfig.from_dict(adv_cfg_dict)
+        adv_cfg.auto_drop            = False   # 诊断用途，不修改数据
+        adv_cfg.compute_per_feature_auc = False  # 加速（只需 Stage 1 判断）
+
+        # 只保留数值列（排除序列列、object 列等无法直接对比的列）
+        num_cols_tr = X_train.select_dtypes(include=np.number).columns.tolist()
+        num_cols_te = X_test.select_dtypes(include=np.number).columns.tolist()
+        shared_num  = [c for c in num_cols_tr if c in num_cols_te]
+
+        if not shared_num:
+            self.logger.warning(
+                "[Step 3.5] 特征工程后无共同数值列可比较，跳过二阶对抗验证。"
+            )
+            return
+
+        result_post = run_adversarial_validation(
+            X_train  = X_train[shared_num],
+            X_test   = X_test[shared_num],
+            config   = adv_cfg,
+            save_dir = None,   # 不重复写文件
+        )
+        if result_post is None:
+            return
+
+        post_auc = result_post.overall_auc
+        pre_auc  = self._pre_fe_av_auc
+        delta    = post_auc - pre_auc
+        elapsed  = time.perf_counter() - t0
+
+        # 写入 report
+        self.report.setdefault("adversarial_validation", {}).update({
+            "post_fe_auc":   round(post_auc, 6),
+            "fe_auc_delta":  round(delta, 6),
+        })
+
+        self.logger.info(
+            f"[Step 3.5] AV 对比 | "
+            f"原始数据 AUC={pre_auc:.4f} | "
+            f"特征工程后 AUC={post_auc:.4f} | "
+            f"Δ={delta:+.4f} | 耗时 {elapsed:.1f}s"
+        )
+
+        DRIFT_THRESHOLD = 0.05
+        if delta > DRIFT_THRESHOLD:
+            top5 = result_post.feature_importance.head(5)
+
+            self.logger.warning(
+                "\n" + "⚠ " * 25 + "\n"
+                "  [二阶对抗验证 — 漂移警告]\n"
+                f"  特征工程后 AUC 提升 {delta:+.4f}，超过阈值 {DRIFT_THRESHOLD}！\n"
+                "  特征工程可能向模型引入了与测试集分布差异高度相关的信号。\n"
+                "  建议指挥官执行以下回滚/检查操作：\n"
+                "    1. 确认 use_oof_transform: true（目标编码等必须折内计算）\n"
+                "    2. 检查 Lag / Diff Transformer 是否使用了未来数据\n"
+                "    3. 在 features.transformers 中逐一禁用可疑 Transformer 后重跑\n"
+                + "⚠ " * 25
+            )
+            self.logger.warning("  漂移最严重的 Top-5 特征（重点检查）：")
+            for rank, (_, row) in enumerate(top5.iterrows(), 1):
+                self.logger.warning(
+                    f"    {rank}. {str(row['feature']):<40} "
+                    f"importance={row['importance_mean']:.6f}"
+                )
+        else:
+            self.logger.info(
+                "[Step 3.5] ✓ 特征工程后漂移增量在可接受范围内，无需回滚。"
+            )
+
+    # ------------------------------------------------------------------
     # Step 3: 特征工程
     # ------------------------------------------------------------------
 
@@ -588,6 +801,22 @@ class TrainPipeline:
         task = self.cfg["experiment"]["task"]
         seed = self.cfg["experiment"].get("seed", 42)
         model = _build_model(model_cfg, task, seed)
+
+        # ── 动态负采样配置注入（深度模型专属）────────────────────────
+        ns_dict = model_cfg.get("negative_sampling")
+        if ns_dict and ns_dict.get("enable", False):
+            if hasattr(model, "negative_sampler_config"):
+                model.negative_sampler_config = NegativeSamplerConfig.from_dict(ns_dict)
+                self.logger.info(
+                    f"  → [{name}] 动态负采样已启用 | "
+                    f"neg_ratio={ns_dict.get('neg_ratio', 4)} | "
+                    f"buffer={ns_dict.get('buffer_size', 3)}"
+                )
+            else:
+                self.logger.warning(
+                    f"  → [{name}] negative_sampling 在 YAML 中已配置，"
+                    f"但该模型不支持动态负采样（未实现 negative_sampler_config 接口）。"
+                )
 
         # ── 可选：Optuna 调参 ────────────────────────────────────────
         tune_cfg = self.cfg.get("tuning", {})
@@ -690,13 +919,20 @@ class TrainPipeline:
 
         results_list = [cv_results[n] for n in model_names]
 
+        # ── 解析 Hill Climbing 专属配置（可选）─────────────────────
+        hc_dict = ens_cfg.get("hill_climbing")
+        hc_cfg  = HillClimbingConfig.from_dict(hc_dict) if hc_dict else None
+
         stacker = StackingEnsemble(
             results           = results_list,
             model_names       = model_names,
             config            = StackingConfig(
                 task                 = ens_cfg.get("task", self.cfg["experiment"]["task"]),
+                method               = ens_cfg.get("method", "stacking"),
                 scale_meta_features  = ens_cfg.get("scale_meta_features", True),
                 passthrough          = ens_cfg.get("passthrough", False),
+                clip_oof             = ens_cfg.get("clip_oof", False),
+                hill_climbing        = hc_cfg,
             ),
             X_train_original  = X_train if ens_cfg.get("passthrough") else None,
             X_test_original   = X_test  if ens_cfg.get("passthrough") else None,
