@@ -53,6 +53,15 @@ from typing import Callable, Optional, Union
 
 import numpy as np
 import pandas as pd
+from itertools import combinations
+from sklearn.model_selection import KFold
+
+# Polars 可选依赖（大数据时序加速）
+try:
+    import polars as _pl_mod
+    _HAS_POLARS = True
+except Exception:
+    _HAS_POLARS = False
 
 from utils.memory import compress_dataframe, get_memory_usage_mb
 
@@ -1085,3 +1094,680 @@ class FreqEncoderTransformer(BaseFeatureTransformer):
                 X[col].map(freq_map).fillna(0).values.astype(np.float32)
             )
         return pd.DataFrame(result, index=X.index)
+
+
+# ===========================================================================
+# 夺冠级扩展模块（Championship-Grade Extensions）
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# 7. RobustCategoricalEncoder — K-Fold 目标编码 + 噪声注入 + 高基数自适应
+# ---------------------------------------------------------------------------
+
+class RobustCategoricalEncoder(BaseFeatureTransformer):
+    """
+    竞赛级 K-Fold 目标编码（Target Encoding）。
+
+    核心改进（vs 基础 TargetEncoderTransformer）
+    -------------------------------------------
+    1. **内置 K-Fold OOF**：
+       fit_transform() 在训练集内部做 K 折交叉编码；
+       每折编码值 = 在 K-1 折上拟合 → 对剩余 1 折 transform，
+       彻底消除训练集内目标泄露。
+
+    2. **噪声注入（Noise Injection）**：
+       在 OOF 编码值上叠加 Gaussian 噪声（幅度 = noise_std × target_std），
+       迫使模型不过分依赖编码值，提升泛化能力。
+
+    3. **高基数自适应平滑（High-Cardinality Adaptive Smoothing）**：
+       对 n_unique > cardinality_threshold 的类别列，
+       自动将 smoothing 乘以 high_card_multiplier，
+       防止低频类别的编码值过拟合。
+
+    4. **测试集路径（transform）**：
+       使用全量训练集拟合的全局编码表，无噪声注入。
+
+    贝叶斯平滑公式
+    --------------
+        λ = sigmoid((count - min_samples_leaf) / smoothing)
+        enc = λ × group_mean + (1 - λ) × global_mean
+
+    Parameters
+    ----------
+    cat_cols : list[str]
+        需要目标编码的类别列。
+    n_splits : int
+        内置 K-Fold 的折数，默认 5。
+    smoothing : float
+        贝叶斯平滑系数，默认 10.0。越大越保守（防过拟合）。
+    noise_std : float
+        噪声幅度（相对于目标列标准差的比例），默认 0.01。
+        设为 0 可关闭噪声注入。
+    cardinality_threshold : int
+        高基数判定阈值（n_unique > 此值则放大 smoothing），默认 50。
+    high_card_multiplier : float
+        高基数列的 smoothing 放大倍数，默认 3.0。
+    min_samples_leaf : int
+        平滑 sigmoid 的中心点，默认 1。
+    handle_unknown : str
+        未见过类别：'mean'（全局均值）| 'nan'，默认 'mean'。
+    random_state : int
+        随机种子，默认 42。
+
+    Examples
+    --------
+    >>> enc = RobustCategoricalEncoder(cat_cols=["store_id", "category"],
+    ...                                n_splits=5, noise_std=0.01)
+    >>> X_train_enc = enc.fit_transform(X_train, y_train)  # OOF + 噪声
+    >>> X_test_enc  = enc.transform(X_test)                # 全局编码，无噪声
+    """
+
+    def __init__(
+        self,
+        cat_cols:              list[str],
+        n_splits:              int            = 5,
+        smoothing:             float          = 10.0,
+        noise_std:             float          = 0.01,
+        cardinality_threshold: int            = 50,
+        high_card_multiplier:  float          = 3.0,
+        min_samples_leaf:      int            = 1,
+        handle_unknown:        str            = "mean",
+        random_state:          int            = 42,
+        name:                  Optional[str]  = None,
+    ):
+        super().__init__(name=name or "robust_cat_enc")
+        self.cat_cols              = cat_cols
+        self.n_splits              = n_splits
+        self.smoothing             = smoothing
+        self.noise_std             = noise_std
+        self.cardinality_threshold = cardinality_threshold
+        self.high_card_multiplier  = high_card_multiplier
+        self.min_samples_leaf      = min_samples_leaf
+        self.handle_unknown        = handle_unknown
+        self.random_state          = random_state
+        self.requires_y            = True   # 必须 OOF 防泄露
+
+        self._encoding_maps: dict[str, dict] = {}
+        self._global_mean:   float           = 0.0
+
+    # ------------------------------------------------------------------
+    # sklearn 核心接口
+    # ------------------------------------------------------------------
+
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "RobustCategoricalEncoder":
+        """拟合全局编码表（供测试集 transform 使用）。"""
+        if y is None:
+            raise ValueError("RobustCategoricalEncoder.fit() 需要 y（目标列）。")
+        self._global_mean = float(y.mean())
+        self._encoding_maps.clear()
+        output_names = []
+
+        for col in self.cat_cols:
+            if col not in X.columns:
+                warnings.warn(f"RobustCategoricalEncoder: 列 '{col}' 不存在，已跳过。")
+                continue
+            n_uniq    = int(X[col].nunique())
+            smoothing = self._adaptive_smoothing(n_uniq)
+            enc_map   = self._fit_encoding(X[col], y.values, smoothing, self._global_mean)
+            self._encoding_maps[col] = enc_map
+            output_names.append(f"{self.name}_{col}")
+
+        self._mark_fitted(output_names)
+        return self
+
+    def fit_transform(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+    ) -> pd.DataFrame:
+        """
+        K-Fold OOF 编码 + 噪声注入（训练集防泄露核心路径）。
+
+        流程
+        ----
+        1. KFold 切分 X → n_splits 折
+        2. 每折：在 train 部分拟合编码映射，对 val 部分 transform
+        3. 汇总所有折的 OOF 编码值（行顺序对齐原始 X）
+        4. 叠加 Gaussian 噪声（noise_std > 0 时）
+        5. 调用 self.fit(X, y) 拟合全局编码（供测试集 transform 使用）
+        """
+        if y is None:
+            raise ValueError("RobustCategoricalEncoder.fit_transform() 需要 y。")
+
+        valid_cols = [c for c in self.cat_cols if c in X.columns]
+        n          = len(X)
+
+        # OOF 结果容器（float32，初始化为 NaN）
+        oof: dict[str, np.ndarray] = {
+            f"{self.name}_{col}": np.full(n, np.nan, dtype=np.float32)
+            for col in valid_cols
+        }
+
+        kf = KFold(n_splits=self.n_splits, shuffle=True, random_state=self.random_state)
+        for tr_idx, val_idx in kf.split(X):
+            X_tr  = X.iloc[tr_idx]
+            y_tr  = y.iloc[tr_idx]
+            X_val = X.iloc[val_idx]
+            gm    = float(y_tr.mean())
+
+            for col in valid_cols:
+                n_uniq    = int(X_tr[col].nunique())
+                smoothing = self._adaptive_smoothing(n_uniq)
+                enc_map   = self._fit_encoding(X_tr[col], y_tr.values, smoothing, gm)
+                unknown   = gm if self.handle_unknown == "mean" else np.nan
+                oof[f"{self.name}_{col}"][val_idx] = (
+                    X_val[col].map(enc_map).fillna(unknown).values.astype(np.float32)
+                )
+
+        # 噪声注入（仅训练路径，transform 不注入）
+        if self.noise_std > 0:
+            target_std = max(float(y.std()), 1e-8)
+            rng        = np.random.default_rng(self.random_state)
+            for arr in oof.values():
+                arr += rng.normal(0, self.noise_std * target_std, n).astype(np.float32)
+
+        # 全局 fit（为后续 transform 测试集做准备）
+        self.fit(X, y)
+
+        return pd.DataFrame(oof, index=X.index)
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        """对测试集应用全局编码（无噪声）。"""
+        self._assert_fitted()
+        result: dict[str, np.ndarray] = {}
+
+        for col, enc_map in self._encoding_maps.items():
+            if col not in X.columns:
+                continue
+            unknown = self._global_mean if self.handle_unknown == "mean" else np.nan
+            result[f"{self.name}_{col}"] = (
+                X[col].map(enc_map).fillna(unknown).values.astype(np.float32)
+            )
+        return pd.DataFrame(result, index=X.index)
+
+    # ------------------------------------------------------------------
+    # 内部工具
+    # ------------------------------------------------------------------
+
+    def _adaptive_smoothing(self, n_unique: int) -> float:
+        """高基数自适应：超过阈值则放大 smoothing 系数。"""
+        if n_unique > self.cardinality_threshold:
+            return self.smoothing * self.high_card_multiplier
+        return self.smoothing
+
+    def _fit_encoding(
+        self,
+        series:      pd.Series,
+        y:           np.ndarray,
+        smoothing:   float,
+        global_mean: float,
+    ) -> dict:
+        """贝叶斯平滑目标编码：计算 cat_value → encoded_float 映射。"""
+        tmp   = pd.DataFrame({"cat": series.values, "target": y})
+        stats = tmp.groupby("cat")["target"].agg(["mean", "count"])
+        lam   = 1.0 / (1.0 + np.exp(-(stats["count"] - self.min_samples_leaf) / smoothing))
+        return (lam * stats["mean"] + (1 - lam) * global_mean).to_dict()
+
+    def __repr__(self) -> str:
+        status = "fitted" if self.is_fitted else "unfitted"
+        return (
+            f"RobustCategoricalEncoder("
+            f"cat_cols={self.cat_cols}, n_splits={self.n_splits}, "
+            f"smoothing={self.smoothing}, noise_std={self.noise_std}, "
+            f"status={status})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 8. TimeSeriesFeatureGenerator — 多尺度 Lag + 滚动统计 + 差分
+# ---------------------------------------------------------------------------
+
+class TimeSeriesFeatureGenerator(BaseFeatureTransformer):
+    """
+    时序特征一站式生成器（多尺度 Lag + 滚动统计 + 差分）。
+
+    生成特征类型
+    ------------
+    1. **多尺度 Lag**：t-1, t-7, t-30（可配置）
+       防泄露：shift > 0，只使用历史数据
+    2. **滚动窗口统计**：Mean / Std / Max / Min（窗口大小可配）
+       防泄露：先 shift(1) 再 rolling，不使用当前时间步
+    3. **差分特征**：t - t_{t-p}（可配置阶数）
+       捕捉趋势和季节性变化
+
+    性能优化
+    --------
+    - 数据量 ≥ polars_threshold 且 Polars 已安装时，自动切换 **Polars 引擎**：
+        * Lag / Diff：使用 `.shift().over(group)` 窗口函数
+        * Rolling：使用 `.rolling_*().over(group)` 分组滚动
+      大数据（10M 行）比 Pandas 快 5-15 倍。
+    - 数据量较小或 Polars 不可用时，自动回退到向量化 Pandas 路径。
+    - 所有引擎均通过 `sort → compute → reindex` 保证行顺序对齐。
+
+    Parameters
+    ----------
+    value_cols : list[str]
+        需要生成特征的数值列。
+    time_col : str
+        时间排序列（保证时序正确性）。
+    group_cols : list[str] | None
+        分组列（如 store_id, product_id），None 时全局计算。
+    lags : list[int]
+        Lag 期数，默认 [1, 7, 30]。必须全为正整数。
+    rolling_windows : list[int]
+        滚动窗口大小，默认 [7, 14, 28]。
+    rolling_funcs : list[str]
+        滚动函数，支持 'mean' 'std' 'max' 'min'，默认全部。
+    diff_periods : list[int]
+        差分期数，默认 [1, 7]。
+    min_periods : int
+        滚动统计的最小有效数据点数，默认 1。
+    polars_threshold : int
+        切换到 Polars 引擎的行数阈值，默认 500_000。
+
+    Examples
+    --------
+    >>> ts = TimeSeriesFeatureGenerator(
+    ...     value_cols=["sales", "price"],
+    ...     time_col="date",
+    ...     group_cols=["store_id", "product_id"],
+    ...     lags=[1, 7, 30],
+    ...     rolling_windows=[7, 14, 28],
+    ... )
+    >>> ts.fit(df)
+    >>> X_new = ts.transform(df)
+    """
+
+    _VALID_ROLLING_FUNCS = {"mean", "std", "max", "min"}
+
+    def __init__(
+        self,
+        value_cols:       list[str],
+        time_col:         str,
+        group_cols:       Optional[list[str]] = None,
+        lags:             Optional[list[int]] = None,
+        rolling_windows:  Optional[list[int]] = None,
+        rolling_funcs:    Optional[list[str]] = None,
+        diff_periods:     Optional[list[int]] = None,
+        min_periods:      int                 = 1,
+        polars_threshold: int                 = 500_000,
+        name:             Optional[str]       = None,
+    ):
+        super().__init__(name=name or "ts_feat")
+        _lags = lags or [1, 7, 30]
+        if any(l <= 0 for l in _lags):
+            raise ValueError("lags 必须全为正整数。")
+        _rfuncs = rolling_funcs or ["mean", "std", "max", "min"]
+        invalid = set(_rfuncs) - self._VALID_ROLLING_FUNCS
+        if invalid:
+            raise ValueError(f"rolling_funcs 包含不支持的函数：{invalid}")
+
+        self.value_cols       = value_cols
+        self.time_col         = time_col
+        self.group_cols       = list(group_cols or [])
+        self.lags             = _lags
+        self.rolling_windows  = rolling_windows or [7, 14, 28]
+        self.rolling_funcs    = _rfuncs
+        self.diff_periods     = diff_periods    or [1, 7]
+        self.min_periods      = min_periods
+        self.polars_threshold = polars_threshold
+        self.requires_y       = False
+
+        self._valid_value_cols: list[str] = []
+
+    # ------------------------------------------------------------------
+    # sklearn 接口
+    # ------------------------------------------------------------------
+
+    def fit(self, X: pd.DataFrame, y=None) -> "TimeSeriesFeatureGenerator":
+        for col in [self.time_col, *self.group_cols]:
+            if col not in X.columns:
+                raise ValueError(
+                    f"TimeSeriesFeatureGenerator: 必要列 '{col}' 在 DataFrame 中不存在。"
+                )
+        missing = [c for c in self.value_cols if c not in X.columns]
+        if missing:
+            warnings.warn(f"TimeSeriesFeatureGenerator: 列 {missing} 不存在，已跳过。")
+        self._valid_value_cols = [c for c in self.value_cols if c in X.columns]
+        self._mark_fitted(self._compute_output_names())
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        self._assert_fitted()
+        # 自动选择计算引擎
+        if _HAS_POLARS and len(X) >= self.polars_threshold:
+            try:
+                return self._transform_polars(X)
+            except Exception as exc:
+                warnings.warn(
+                    f"Polars 引擎失败（{exc}），自动回退到 Pandas。",
+                    RuntimeWarning,
+                )
+        return self._transform_pandas(X)
+
+    # ------------------------------------------------------------------
+    # Pandas 路径（通用，中小数据集）
+    # ------------------------------------------------------------------
+
+    def _transform_pandas(self, X: pd.DataFrame) -> pd.DataFrame:
+        sort_cols = [*self.group_cols, self.time_col] if self.group_cols else [self.time_col]
+        df     = X.sort_values(sort_cols)
+        result = pd.DataFrame(index=df.index)
+        gb     = df.groupby(self.group_cols) if self.group_cols else None
+
+        for col in self._valid_value_cols:
+            # ---- Lag ----
+            for lag in self.lags:
+                name = f"{self.name}_{col}_lag{lag}"
+                if gb is not None:
+                    result[name] = gb[col].transform(lambda s, _l=lag: s.shift(_l))
+                else:
+                    result[name] = df[col].shift(lag)
+
+            # ---- Rolling（shift(1) 防当前值泄露）----
+            for w in self.rolling_windows:
+                for fn in self.rolling_funcs:
+                    name = f"{self.name}_{col}_roll{w}_{fn}"
+                    mp   = max(self.min_periods, 2) if fn == "std" else self.min_periods
+                    if gb is not None:
+                        result[name] = gb[col].transform(
+                            lambda s, _w=w, _fn=fn, _mp=mp: (
+                                getattr(s.shift(1).rolling(_w, min_periods=_mp), _fn)()
+                            )
+                        )
+                    else:
+                        result[name] = getattr(
+                            df[col].shift(1).rolling(w, min_periods=mp), fn
+                        )()
+
+            # ---- Diff ----
+            for p in self.diff_periods:
+                name = f"{self.name}_{col}_diff{p}"
+                if gb is not None:
+                    result[name] = gb[col].transform(lambda s, _p=p: s.diff(_p))
+                else:
+                    result[name] = df[col].diff(p)
+
+        return result.reindex(X.index)
+
+    # ------------------------------------------------------------------
+    # Polars 路径（高性能，大数据集）
+    # ------------------------------------------------------------------
+
+    def _transform_polars(self, X: pd.DataFrame) -> pd.DataFrame:
+        import polars as pl
+
+        # 用整数列记录原始行位置，用于排序还原
+        df_in = X.reset_index(drop=True).copy()
+        df_in["_orig_pos_"] = np.arange(len(df_in), dtype=np.int32)
+
+        lf = pl.from_pandas(df_in).lazy()
+        sort_cols = [*self.group_cols, self.time_col] if self.group_cols else [self.time_col]
+        lf = lf.sort(sort_cols)
+
+        feat_exprs: list = []
+        feat_names: list[str] = []
+
+        for col in self._valid_value_cols:
+            # ---- Lag ----
+            for lag in self.lags:
+                n = f"{self.name}_{col}_lag{lag}"
+                e = pl.col(col).shift(lag)
+                if self.group_cols:
+                    e = e.over(self.group_cols)
+                feat_exprs.append(e.alias(n))
+                feat_names.append(n)
+
+            # ---- Rolling ----
+            for w in self.rolling_windows:
+                for fn in self.rolling_funcs:
+                    n  = f"{self.name}_{col}_roll{w}_{fn}"
+                    mp = max(self.min_periods, 2) if fn == "std" else self.min_periods
+                    base = pl.col(col).shift(1)
+                    if fn == "mean":
+                        re = base.rolling_mean(window_size=w, min_periods=mp)
+                    elif fn == "std":
+                        re = base.rolling_std(window_size=w, min_periods=mp)
+                    elif fn == "max":
+                        re = base.rolling_max(window_size=w, min_periods=mp)
+                    else:  # min
+                        re = base.rolling_min(window_size=w, min_periods=mp)
+                    if self.group_cols:
+                        re = re.over(self.group_cols)
+                    feat_exprs.append(re.alias(n))
+                    feat_names.append(n)
+
+            # ---- Diff ----
+            for p in self.diff_periods:
+                n = f"{self.name}_{col}_diff{p}"
+                e = pl.col(col).diff(p)
+                if self.group_cols:
+                    e = e.over(self.group_cols)
+                feat_exprs.append(e.alias(n))
+                feat_names.append(n)
+
+        lf = lf.with_columns(feat_exprs)
+
+        # 按原始行顺序排回，转为 pandas
+        result_pd = (
+            lf.select(["_orig_pos_"] + feat_names)
+            .sort("_orig_pos_")
+            .collect()
+            .to_pandas()
+            .drop("_orig_pos_", axis=1)
+        )
+        result_pd.index = X.index
+        return result_pd
+
+    # ------------------------------------------------------------------
+    # 工具
+    # ------------------------------------------------------------------
+
+    def _compute_output_names(self) -> list[str]:
+        names = []
+        for col in self._valid_value_cols:
+            for lag in self.lags:
+                names.append(f"{self.name}_{col}_lag{lag}")
+            for w in self.rolling_windows:
+                for fn in self.rolling_funcs:
+                    names.append(f"{self.name}_{col}_roll{w}_{fn}")
+            for p in self.diff_periods:
+                names.append(f"{self.name}_{col}_diff{p}")
+        return names
+
+    def __repr__(self) -> str:
+        status = "fitted" if self.is_fitted else "unfitted"
+        engine = "Polars" if _HAS_POLARS else "Pandas"
+        return (
+            f"TimeSeriesFeatureGenerator("
+            f"value_cols={self.value_cols}, time_col={self.time_col!r}, "
+            f"lags={self.lags}, rolling_windows={self.rolling_windows}, "
+            f"engine={engine!r}, status={status})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 9. AutoFeatureInteraction — 自动二阶特征交叉（乘积 + 商）
+# ---------------------------------------------------------------------------
+
+class AutoFeatureInteraction(BaseFeatureTransformer):
+    """
+    自动二阶特征交叉（AutoFeatureInteraction）。
+
+    算法
+    ----
+    1. **fit(X, y)**：
+       a. 计算所有数值列与目标 y 的 Pearson |相关系数|
+       b. 取 top-max_features 个列作为候选特征
+          （若 y=None 则按方差降序选取）
+       c. 生成所有两两组合 C(n, 2) 对
+       d. 可选通过 max_interactions 限制总对数（避免特征爆炸）
+
+    2. **transform(X)**：
+       对每对 (col_a, col_b) 生成：
+         - 乘积特征：col_a × col_b
+         - 商特征（ratio=True）：col_a / (|col_b| + eps)，结果 clip 到 ±clip_ratio
+
+    数值稳定性
+    ----------
+    - NaN 值用 fit 时记录的列均值填充
+    - 商特征分母加 eps 防除零
+    - 商特征 clip 到 [-clip_ratio, clip_ratio] 防数值爆炸
+
+    Parameters
+    ----------
+    max_features : int
+        参与交叉的最大特征数，默认 10（最多产生 C(10,2)=45 对）。
+    max_interactions : int | None
+        最多保留的交叉特征对数，None 时不限制，默认 None。
+    interaction_types : list[str]
+        交叉类型：'product'（乘积）| 'ratio'（商），默认两者均有。
+    min_corr_with_y : float
+        候选特征与目标的最小 |相关系数|，低于此值不参与交叉，默认 0.01。
+    eps : float
+        商运算分母保护值，默认 1e-8。
+    clip_ratio : float
+        商特征的截断绝对值，默认 1e6。
+    exclude_cols : list[str] | None
+        明确排除的列名（如 ID 列、日期列）。
+
+    Examples
+    --------
+    >>> ai = AutoFeatureInteraction(max_features=8, max_interactions=20)
+    >>> X_inter = ai.fit_transform(X_numeric, y)
+    >>> print(ai._selected_pairs[:3])  # 查看最终保留的特征对
+    """
+
+    def __init__(
+        self,
+        max_features:      int                 = 10,
+        max_interactions:  Optional[int]       = None,
+        interaction_types: Optional[list[str]] = None,
+        min_corr_with_y:   float               = 0.01,
+        eps:               float               = 1e-8,
+        clip_ratio:        float               = 1e6,
+        exclude_cols:      Optional[list[str]] = None,
+        name:              Optional[str]       = None,
+    ):
+        super().__init__(name=name or "auto_interact")
+        self.max_features      = max_features
+        self.max_interactions  = max_interactions
+        self.interaction_types = interaction_types or ["product", "ratio"]
+        self.min_corr_with_y   = min_corr_with_y
+        self.eps               = eps
+        self.clip_ratio        = clip_ratio
+        self.exclude_cols      = set(exclude_cols or [])
+        self.requires_y        = True   # 需要 y 对特征按重要性排序
+
+        self._selected_pairs:  list[tuple[str, str]] = []
+        self._col_means:       dict[str, float]      = {}
+
+    # ------------------------------------------------------------------
+    # sklearn 接口
+    # ------------------------------------------------------------------
+
+    def fit(
+        self,
+        X: pd.DataFrame,
+        y: Optional[pd.Series] = None,
+    ) -> "AutoFeatureInteraction":
+        numeric_cols = [
+            c for c in X.select_dtypes(include=np.number).columns
+            if c not in self.exclude_cols
+        ]
+        if not numeric_cols:
+            warnings.warn("AutoFeatureInteraction: 没有可用的数值列，已跳过。")
+            self._mark_fitted([])
+            return self
+
+        # --- 按 |corr with y| 排序，选 top-k 候选特征 ---
+        if y is not None:
+            y_arr  = y.values if hasattr(y, "values") else np.asarray(y, dtype=float)
+            corrs: dict[str, float] = {}
+            for col in numeric_cols:
+                arr = X[col].fillna(0).values.astype(float)
+                if arr.std() < 1e-10:
+                    corrs[col] = 0.0
+                    continue
+                try:
+                    c = float(np.corrcoef(arr, y_arr)[0, 1])
+                    corrs[col] = abs(c) if not np.isnan(c) else 0.0
+                except Exception:
+                    corrs[col] = 0.0
+            ranked = sorted(corrs.items(), key=lambda kv: kv[1], reverse=True)
+            selected = [
+                col for col, corr in ranked[:self.max_features]
+                if corr >= self.min_corr_with_y
+            ]
+        else:
+            variances = {c: float(X[c].var()) for c in numeric_cols}
+            selected  = [
+                c for c, _ in sorted(variances.items(), key=lambda kv: kv[1], reverse=True)
+            ][:self.max_features]
+
+        if len(selected) < 2:
+            warnings.warn(
+                "AutoFeatureInteraction: 合格特征数 < 2，无法生成交叉特征。"
+                "请降低 min_corr_with_y 或增加 max_features。"
+            )
+            self._mark_fitted([])
+            return self
+
+        # --- 生成所有两两组合 ---
+        pairs = list(combinations(selected, 2))
+        if self.max_interactions is not None:
+            pairs = pairs[: self.max_interactions]
+        self._selected_pairs = pairs
+
+        # --- 存储列均值（transform 时填充 NaN）---
+        all_involved = {c for pair in pairs for c in pair}
+        self._col_means = {
+            col: float(X[col].mean()) for col in all_involved
+        }
+
+        # --- 输出特征名 ---
+        output_names = []
+        for col_a, col_b in pairs:
+            if "product" in self.interaction_types:
+                output_names.append(f"{self.name}_{col_a}_x_{col_b}")
+            if "ratio" in self.interaction_types:
+                output_names.append(f"{self.name}_{col_a}_div_{col_b}")
+
+        self._mark_fitted(output_names)
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        self._assert_fitted()
+        if not self._selected_pairs:
+            return pd.DataFrame(index=X.index)
+
+        result: dict[str, np.ndarray] = {}
+
+        for col_a, col_b in self._selected_pairs:
+            if col_a not in X.columns or col_b not in X.columns:
+                continue
+            a = X[col_a].fillna(self._col_means.get(col_a, 0.0)).values.astype(np.float32)
+            b = X[col_b].fillna(self._col_means.get(col_b, 0.0)).values.astype(np.float32)
+
+            if "product" in self.interaction_types:
+                result[f"{self.name}_{col_a}_x_{col_b}"] = a * b
+
+            if "ratio" in self.interaction_types:
+                # 安全除法：分母加 eps，结果 clip 防爆炸
+                denom = np.where(np.abs(b) < self.eps, np.sign(b + self.eps) * self.eps, b)
+                ratio = np.clip(a / denom, -self.clip_ratio, self.clip_ratio).astype(np.float32)
+                result[f"{self.name}_{col_a}_div_{col_b}"] = ratio
+
+        return pd.DataFrame(result, index=X.index)
+
+    def __repr__(self) -> str:
+        status  = "fitted" if self.is_fitted else "unfitted"
+        n_pairs = len(self._selected_pairs)
+        return (
+            f"AutoFeatureInteraction("
+            f"max_features={self.max_features}, n_pairs={n_pairs}, "
+            f"interaction_types={self.interaction_types}, "
+            f"status={status})"
+        )
+

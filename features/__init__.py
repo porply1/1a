@@ -10,7 +10,11 @@ from features.engine import (
     LagTransformer,
     TargetEncoderTransformer,
     FreqEncoderTransformer,
+    RobustCategoricalEncoder,
+    TimeSeriesFeatureGenerator,
+    AutoFeatureInteraction,
 )
+from features.selector import NullImportanceSelector
 
 __all__ = [
     "BaseFeatureTransformer",
@@ -21,4 +25,8 @@ __all__ = [
     "LagTransformer",
     "TargetEncoderTransformer",
     "FreqEncoderTransformer",
+    "RobustCategoricalEncoder",
+    "TimeSeriesFeatureGenerator",
+    "AutoFeatureInteraction",
+    "NullImportanceSelector",
 ]

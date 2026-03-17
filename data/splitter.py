@@ -42,7 +42,6 @@ from sklearn.model_selection import (
     StratifiedKFold,
     GroupKFold,
     StratifiedGroupKFold,
-    TimeSeriesSplit,
 )
 
 # ---------------------------------------------------------------------------
@@ -79,6 +78,10 @@ class CVConfig:
     gap: int = 0
     max_train_size: Optional[int] = None
     purge_pct: float = 0.01
+    # ---- TimeSeriesSplitter 专用 ----
+    mode: str = "expanding"           # "expanding" | "sliding"
+    test_size: Optional[int] = None   # 验证集固定大小；None 时自动均分
+    min_train_size: Optional[int] = None  # 最小训练集大小；不足时跳过该折
 
 
 # ---------------------------------------------------------------------------
@@ -187,45 +190,192 @@ class StratifiedGroupKFoldSplitter(BaseCVSplitter):
 
 class TimeSeriesSplitter(BaseCVSplitter):
     """
-    标准时序切分（expanding window），不打乱顺序。
-    val 集始终在 train 集之后，支持 gap 参数。
+    冠军级时间序列切分器。
 
-    注意：X 必须已按时间升序排列。
+    同时支持 Expanding Window（扩张窗口）和 Sliding Window（滑动窗口）策略，
+    内置 gap_size 防近期数据泄露，兼容 Pandas / Polars / NumPy。
+
+    Parameters
+    ----------
+    cfg : CVConfig
+        关键字段：
+        n_splits       : 折数，默认 5。
+        mode           : "expanding"（默认）或 "sliding"。
+                         expanding — 每折训练集向历史累积（ExpandingWindow）。
+                         sliding   — 训练集大小固定，窗口向前滑动（SlidingWindow），
+                                     需配合 max_train_size 使用。
+        gap            : 训练末尾到验证首端之间跳过的样本数（gap_size 防泄露），默认 0。
+                         例：训练到位置 t，gap=7，则验证集从 t+8 开始。
+        test_size      : 验证集固定大小；None 时自动均分为 n_samples//(n_splits+1)。
+        min_train_size : 最小训练集样本数；不足时跳过该折并发出警告。
+        max_train_size : 训练集最大样本数（sliding 模式的窗口宽度）。
+
+    Notes
+    -----
+    - X 必须已按时间升序排列（splitter 本身不排序）。
+    - split() 只依赖 len(X)，天然兼容 pandas.DataFrame / polars.DataFrame / np.ndarray。
+    - 返回整数位置索引 np.ndarray，使用方式：X.iloc[train_idx] 或 X[train_idx]。
+
+    Examples
+    --------
+    >>> # Expanding Window，gap=7 天防泄露
+    >>> cfg = CVConfig(strategy="timeseries", n_splits=5, gap=7, mode="expanding")
+    >>> ts = TimeSeriesSplitter(cfg)
+    >>> for tr, va in ts.split(df):
+    ...     assert tr.max() + 7 < va.min()
+
+    >>> # Sliding Window，固定 200 个样本训练窗口
+    >>> cfg = CVConfig(strategy="timeseries", n_splits=5, gap=0,
+    ...                mode="sliding", max_train_size=200)
+    >>> ts = TimeSeriesSplitter(cfg)
     """
 
+    VALID_MODES = {"expanding", "sliding"}
+
     def __init__(self, cfg: CVConfig):
-        self._tss = TimeSeriesSplit(
-            n_splits=cfg.n_splits,
-            gap=cfg.gap,
-            max_train_size=cfg.max_train_size,
+        if cfg.mode not in self.VALID_MODES:
+            raise ValueError(
+                f"mode 必须是 {self.VALID_MODES}，得到 '{cfg.mode}'"
+            )
+        if cfg.gap < 0:
+            raise ValueError(f"gap_size 不能为负数，得到 {cfg.gap}")
+        if cfg.mode == "sliding" and cfg.max_train_size is None:
+            warnings.warn(
+                "sliding 模式下未设置 max_train_size，行为退化为 expanding 模式。",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        self.n_splits       = cfg.n_splits
+        self.mode           = cfg.mode
+        self.gap_size       = cfg.gap
+        self.test_size      = cfg.test_size
+        self.min_train_size = cfg.min_train_size
+        self.max_train_size = cfg.max_train_size
+
+    def split(
+        self,
+        X,
+        y=None,
+        groups=None,
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        """
+        Parameters
+        ----------
+        X : pd.DataFrame | pl.DataFrame | np.ndarray
+            只使用 len(X)，不访问内容，天然兼容多种后端。
+        y, groups : 忽略（保持接口统一性）
+
+        Returns
+        -------
+        list of (train_idx, val_idx) — 整数位置索引 np.ndarray
+        """
+        n_samples = len(X)
+
+        # 每折验证集大小（使用纯整数运算，避免浮点误差）
+        test_sz = (
+            self.test_size
+            if self.test_size is not None
+            else n_samples // (self.n_splits + 1)
         )
+        if test_sz <= 0:
+            raise ValueError(
+                f"样本数 {n_samples} 不足以支撑 {self.n_splits} 折切分，"
+                f"请减少 n_splits 或增大 test_size。"
+            )
 
-    def split(self, X, y=None, groups=None):
-        return list(self._tss.split(X))
+        folds: list[tuple[np.ndarray, np.ndarray]] = []
 
-    def __repr__(self):
+        for i in range(self.n_splits):
+            # --- 验证集定位（从右往左，第 n_splits-1-i 个 test_sz 窗口） ---
+            val_end   = n_samples - (self.n_splits - 1 - i) * test_sz
+            val_start = val_end - test_sz
+
+            # --- gap 隔离：训练集不超过 val_start - gap_size ---
+            train_end = val_start - self.gap_size
+
+            if train_end <= 0:
+                warnings.warn(
+                    f"第 {i} 折 train_end={train_end}≤0（gap_size={self.gap_size} 过大），"
+                    "已跳过。",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
+
+            # --- 训练集起点（expanding vs sliding） ---
+            if self.mode == "sliding" and self.max_train_size is not None:
+                # 滑动窗口：固定宽度，窗口向前移动
+                train_start = max(0, train_end - self.max_train_size)
+            else:
+                # 扩张窗口：从 0 开始累积
+                train_start = 0
+
+            # --- 最小训练集约束 ---
+            actual_train_size = train_end - train_start
+            if self.min_train_size and actual_train_size < self.min_train_size:
+                warnings.warn(
+                    f"第 {i} 折训练集大小 {actual_train_size} < "
+                    f"min_train_size {self.min_train_size}，已跳过。",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
+
+            # --- 使用 np.arange 纯索引切片，零内存拷贝 ---
+            train_idx = np.arange(train_start, train_end)
+            val_idx   = np.arange(val_start,   val_end)
+            folds.append((train_idx, val_idx))
+
+        return folds
+
+    def __repr__(self) -> str:
         return (
-            f"TimeSeriesSplitter(n_splits={self._tss.n_splits}, "
-            f"gap={self._tss.gap})"
+            f"TimeSeriesSplitter("
+            f"n_splits={self.n_splits}, "
+            f"mode={self.mode!r}, "
+            f"gap_size={self.gap_size})"
         )
 
 
 class PurgedGroupTimeSeriesSplitter(BaseCVSplitter):
     """
-    带 purge 的时序 Group 切分，Kaggle 时序竞赛防泄露核武器。
+    冠军级时序 Group 切分器，带 Purge + Gap 双重防泄露机制。
 
-    算法：
-      1. 按 groups（时间戳或时间 group id）对样本排序
-      2. 将 group 按时间顺序分为 n_splits + 1 段
-      3. 第 i 折：前 i 段为候选训练集，第 i+1 段为验证集
-      4. 从验证集左边界向左清除 purge_n_groups 个 group（防止近邻泄露）
-      5. 若设 gap，额外跳过 gap 个 group
+    适用场景
+    --------
+    - 多城市、多股票等带实体 group 属性的时间序列
+    - 同一实体 group 的时间跨度可能与 val 窗口发生"时间重叠"
+      （即某只股票的训练数据和验证期高度相邻，导致 entity-level leakage）
+
+    核心防泄露逻辑（参考 Lopez de Prado, AFML Ch.7）
+    -----------------------------------------------
+    1. 以时间戳将样本均分为 n_splits+1 段，第 i+1 段为 val；
+    2. 计算 purge_boundary = min(val_timestamps) - gap_size；
+    3. 对每个实体 group g：
+         若 max(g 的所有时间戳) >= purge_boundary → 整组从训练集剔除；
+    4. 此机制确保即使同一 group 的数据横跨 gap 区间，也会被完整清除。
+
+    split() 签名
+    ------------
+    split(X, y=None, groups=entity_labels, timestamps=time_values)
+
+    - groups     : 实体标签（城市名 / 股票代码 / 用户 ID 等），shape (n,)
+    - timestamps : 每个样本的时间值（int/float/可排序类型），shape (n,)
+                   若为 None，则回退到"以 groups 本身作为时间轴"的兼容模式。
+
+    兼容模式（timestamps=None）
+    --------------------------
+    与原接口保持一致：groups 既是实体也是时间排序键。
+    每个唯一 group 视为一个独立时间槽，按 group 值排序后切分。
+    purge_boundary = 距 val_start 左边 gap_size 个 group 处。
 
     Parameters
     ----------
-    groups : array-like
-        每行对应的时间 group 标识（整数或可比较类型），
-        值越大代表越晚。
+    cfg : CVConfig
+        n_splits  : 折数
+        gap       : gap_size（时间戳单位），默认 0
+        purge_pct : 兼容模式下 purge 比例，默认 0.01（新模式不使用此参数）
 
     References
     ----------
@@ -233,21 +383,128 @@ class PurgedGroupTimeSeriesSplitter(BaseCVSplitter):
     """
 
     def __init__(self, cfg: CVConfig):
-        self.n_splits = cfg.n_splits
-        self.gap = cfg.gap
+        self.n_splits  = cfg.n_splits
+        self.gap_size  = cfg.gap
         self.purge_pct = cfg.purge_pct
+
+    # ------------------------------------------------------------------
+    # 公共接口
+    # ------------------------------------------------------------------
 
     def split(
         self,
-        X: pd.DataFrame,
+        X,
         y=None,
-        groups: Optional[pd.Series] = None,
+        groups=None,
+        timestamps=None,
     ) -> list[tuple[np.ndarray, np.ndarray]]:
+        """
+        Parameters
+        ----------
+        X          : array-like，仅用 len(X)，兼容 pandas/polars/numpy
+        groups     : 实体标签，shape (n,)，不能为 None
+        timestamps : 时间戳，shape (n,)；None 时启用兼容模式
+        """
         if groups is None:
-            raise ValueError("PurgedGroupTimeSeriesSplitter 需要 groups（时间 group）")
+            raise ValueError(
+                "PurgedGroupTimeSeriesSplitter.split() 需要 groups 参数。\n"
+                "  新模式：groups=实体标签（股票/城市），timestamps=时间值\n"
+                "  兼容模式：groups=时间 group id（原接口）"
+            )
 
-        groups = np.asarray(groups)
-        unique_groups = np.unique(groups)
+        groups_arr = np.asarray(groups)
+
+        if timestamps is not None:
+            # ---- 新模式：实体 group + 独立时间戳，支持时间重叠 purge ----
+            ts = np.asarray(timestamps, dtype=float)
+            if len(ts) != len(groups_arr):
+                raise ValueError(
+                    f"timestamps 长度 ({len(ts)}) 与 groups 长度 ({len(groups_arr)}) 不一致"
+                )
+            return self._split_entity_mode(groups_arr, ts)
+        else:
+            # ---- 兼容模式：groups 即时间 group（原行为，略有改进） ----
+            return self._split_legacy_mode(groups_arr)
+
+    # ------------------------------------------------------------------
+    # 新模式：实体 group + 时间戳
+    # ------------------------------------------------------------------
+
+    def _split_entity_mode(
+        self,
+        groups_arr: np.ndarray,
+        ts: np.ndarray,
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        """
+        行级 purge：以时间戳轴切分，移除所有 ts >= purge_boundary 的训练样本。
+
+        设计原则
+        --------
+        金融 / 多城市场景中，同一实体（如某只股票）在整个时间轴上均有数据，
+        不能因"实体出现在 val 期"就整组剔除——那会清空所有训练数据。
+        正确做法是：
+          - 训练集 = 所有 ts < purge_boundary 的行（跨实体）
+          - 验证集 = 所有 ts 在 val 桶内的行（跨实体）
+          - 同一实体可同时出现在 train（早期）和 val（晚期），这是正常的时序切分
+          - gap_size 保证训练集最晚时间戳 < val 开始时间 - gap（防止近边界标签泄露）
+
+        时间重叠处理
+        ------------
+        当不同实体的时间范围不连续 / 存在重叠时，本方法以 **唯一时间戳** 为轴
+        均匀划分 val 桶，不依赖行号顺序，天然处理多实体时间重叠问题。
+        """
+        sorted_unique_ts = np.unique(ts)
+        n_unique_ts = len(sorted_unique_ts)
+
+        if n_unique_ts < self.n_splits + 2:
+            raise ValueError(
+                f"唯一时间戳数量 ({n_unique_ts}) 不足以切 {self.n_splits} 折，"
+                f"至少需要 {self.n_splits + 2} 个唯一时间戳。"
+            )
+
+        # 将时间轴均分为 n_splits+1 桶（按时间值，非行号）
+        ts_buckets = np.array_split(sorted_unique_ts, self.n_splits + 1)
+
+        folds: list[tuple[np.ndarray, np.ndarray]] = []
+
+        for fold_idx in range(self.n_splits):
+            val_bucket     = ts_buckets[fold_idx + 1]
+            val_start_time = float(val_bucket.min())
+            # purge_boundary：训练集样本的时间上界（严格小于）
+            purge_boundary = val_start_time - self.gap_size
+
+            # 行级 purge：保留 ts < purge_boundary 的所有行（所有实体均可参与）
+            train_idx = np.where(ts < purge_boundary)[0]
+            # 验证集：时间戳落在 val 桶内（所有实体）
+            val_idx   = np.where(np.isin(ts, val_bucket))[0]
+
+            if len(train_idx) == 0 or len(val_idx) == 0:
+                warnings.warn(
+                    f"第 {fold_idx} 折 train/val 为空"
+                    f"（gap_size={self.gap_size} 可能过大），已跳过。",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+                continue
+
+            folds.append((train_idx, val_idx))
+
+        return folds
+
+    # ------------------------------------------------------------------
+    # 兼容模式：groups 即时间 group（原接口）
+    # ------------------------------------------------------------------
+
+    def _split_legacy_mode(
+        self,
+        groups_arr: np.ndarray,
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        """
+        原接口兼容实现：groups = 时间 group id，值越大越晚。
+
+        purge_boundary 定义：距 val 起始 group 向左 max(gap_size, purge_n) 处。
+        """
+        unique_groups = np.unique(groups_arr)
         n_groups = len(unique_groups)
 
         if n_groups < self.n_splits + 2:
@@ -256,48 +513,34 @@ class PurgedGroupTimeSeriesSplitter(BaseCVSplitter):
                 f"至少需要 {self.n_splits + 2} 个 group。"
             )
 
-        # purge 的 group 数量（至少 1）
-        purge_n = max(1, int(n_groups * self.purge_pct))
+        # purge 区间大小：取 purge_pct 与 gap_size 中的较大值（至少 1）
+        purge_n = max(1, int(n_groups * self.purge_pct), self.gap_size)
 
-        # 将 unique_groups 均匀分为 n_splits + 1 段
+        # 将 unique_groups 均分为 n_splits+1 段
         group_splits = np.array_split(unique_groups, self.n_splits + 1)
 
-        folds = []
+        folds: list[tuple[np.ndarray, np.ndarray]] = []
+
         for fold_idx in range(self.n_splits):
-            # 验证集：第 fold_idx+1 段的所有 group
-            val_groups = set(group_splits[fold_idx + 1])
-
-            # 训练集：fold_idx+1 段之前的所有 group
+            val_groups      = set(group_splits[fold_idx + 1].tolist())
             train_groups_all = np.concatenate(group_splits[: fold_idx + 1])
+            sorted_train    = np.sort(train_groups_all)
+            val_min_group   = min(val_groups)
 
-            # 排除 purge 区域（val 左边 purge_n 个 group）
-            val_min_group = min(val_groups)
-            purge_groups: set = set()
-            sorted_train = np.sort(train_groups_all)
-            # 找出紧靠 val 左边的 purge_n 个 group
-            boundary_groups = sorted_train[sorted_train < val_min_group]
-            if len(boundary_groups) > 0:
-                purge_groups = set(boundary_groups[-purge_n:])
+            # 紧靠 val 左边的 purge_n 个 group
+            boundary = sorted_train[sorted_train < val_min_group]
+            excluded: set = set(boundary[-purge_n:].tolist()) if len(boundary) > 0 else set()
 
-            # 排除 gap 区域（purge 区域再向左 gap 个 group）
-            gap_groups: set = set()
-            if self.gap > 0 and len(boundary_groups) > purge_n:
-                remaining = boundary_groups[: -purge_n]
-                if len(remaining) > 0:
-                    gap_groups = set(remaining[-self.gap:])
-
-            excluded = purge_groups | gap_groups
-            final_train_groups = set(train_groups_all) - excluded
-
-            train_idx = np.where(np.isin(groups, list(final_train_groups)))[0]
-            val_idx   = np.where(np.isin(groups, list(val_groups)))[0]
+            final_train_groups = set(train_groups_all.tolist()) - excluded
+            train_idx = np.where(np.isin(groups_arr, list(final_train_groups)))[0]
+            val_idx   = np.where(np.isin(groups_arr, list(val_groups)))[0]
 
             if len(train_idx) == 0 or len(val_idx) == 0:
                 warnings.warn(
-                    f"第 {fold_idx} 折训练集或验证集为空，已跳过。"
-                    "请检查 n_splits 与 purge_pct 设置。",
+                    f"第 {fold_idx} 折 train/val 为空，已跳过。"
+                    "请检查 n_splits 与 purge_pct/gap_size 设置。",
                     RuntimeWarning,
-                    stacklevel=2,
+                    stacklevel=3,
                 )
                 continue
 
@@ -305,12 +548,11 @@ class PurgedGroupTimeSeriesSplitter(BaseCVSplitter):
 
         return folds
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             f"PurgedGroupTimeSeriesSplitter("
             f"n_splits={self.n_splits}, "
-            f"gap={self.gap}, "
-            f"purge_pct={self.purge_pct})"
+            f"gap_size={self.gap_size})"
         )
 
 

@@ -4,7 +4,8 @@ data/*.parquet
 data/*.feather
 outputs/
 models/checkpoint/
-
+data/tmp/
+*.parquet
 # Python 缓存
 __pycache__/
 *.pyc
