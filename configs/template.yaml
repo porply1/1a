@@ -273,6 +273,74 @@ adversarial_validation:
   seed: 42
 
 # ------------------------------------------------------------
+# 特征筛选配置（Step 3.7，在特征工程后、CV 训练前执行）
+# ------------------------------------------------------------
+feature_selection:
+  enable: false                    # true → 启用 Null Importance 置换检验筛选
+
+  # ── 置换迭代次数 ───────────────────────────────────────────
+  n_iterations: 80                 # 随机打乱标签并训练 N 次（越多越稳健，建议 80~120）
+                                   # 生产建议：80（快速）~ 100（稳健）
+
+  # ── 筛选阈值 ──────────────────────────────────────────────
+  percentile_threshold: 75.0       # 真实重要性须超过 Null 分布第 X 百分位才保留
+                                   # 越高 = 越严格，保留特征越少（建议 70~85）
+  gain_threshold: 0.0              # 真实重要性绝对值下限（0.0 = 不限制）
+                                   # 可设置为 1.0 以过滤极低增益特征
+
+  # ── 任务类型 ──────────────────────────────────────────────
+  task: null                       # null → 自动继承 experiment.task
+                                   # 或显式指定：binary | multiclass | regression
+
+  # ── 加速选项 ──────────────────────────────────────────────
+  max_samples: null                # null → 使用全量数据
+                                   # 整数（如 50000）→ 随机采样加速 Null 迭代
+                                   # 推荐：数据量 > 20 万时设置为 50000~100000
+
+  # ── 随机种子 ──────────────────────────────────────────────
+  random_state: null               # null → 自动继承 experiment.seed
+
+  # ── 产物归档路径（相对于实验目录，自动创建）──────────────
+  # outputs/{exp_name}_{ts}/feature_selection/
+  #   selected_features.json       → 保留特征名单 + 统计摘要
+  #   null_importance_scores.csv   → 每个特征的诊断分数
+  #   null_importance_plot.png     → 重要性分布条形图
+
+# ------------------------------------------------------------
+# 后处理配置（Step 5.5，在所有模型 CV 训练完成后、Stacking 前执行）
+# ------------------------------------------------------------
+post_process:
+  enable: false                    # true → 对每个模型的 OOF 结果执行后处理
+  apply_to_test: true              # true → 将校准后的概率写入 test_predictions
+                                   #         供最终提交使用（OOF 保持不变，供 Stacking）
+
+  # ── 概率校准 ─────────────────────────────────────────────
+  calibration:
+    enable: true                   # true → 启用概率校准（仅 binary / multiclass）
+    method: "isotonic"             # 校准方法：isotonic（默认）| platt
+                                   #   isotonic: 单调保序回归，非参数，适合大样本（≥1000）
+                                   #   platt:    对数几率回归，参数少，适合小样本
+    n_folds: 5                     # 校准器内部 CV 折数（防校准器自身过拟合）
+                                   # 设为 1 → 退化为全局校准（轻微过拟合风险）
+
+  # ── 决策阈值优化（仅 binary 任务）──────────────────────
+  threshold:
+    enable: true                   # true → 通过 Optuna TPE 搜索最优决策阈值
+    metric: "f1"                   # 优化目标：f1 | mcc | fbeta | （自定义暂不支持）
+    beta: 1.0                      # Fbeta 的 beta 值（仅 metric=fbeta 时生效）
+                                   #   beta=1 等同 F1；beta=2 更关注召回率
+    n_trials: 300                  # Optuna 搜索次数（200~500，>500 后边际收益递减）
+    search_range: [0.01, 0.99]     # 阈值搜索范围
+
+  # ── 产物归档路径（相对于实验目录，自动创建）──────────────
+  # outputs/{exp_name}_{ts}/post_process/{model_name}/
+  #   calibrator.pkl               → 已拟合的校准器（可直接用于线上推理）
+  #   threshold.json               → 最优阈值 + OOF 分数 + 使用指标
+  #   calibration_report.json      → Brier Score 校准前后对比
+  # outputs/{exp_name}_{ts}/oof/
+  #   {model_name}_oof_calibrated.npy → 校准后的 OOF 概率（与原始 OOF 并存）
+
+# ------------------------------------------------------------
 # 输出配置
 # ------------------------------------------------------------
 output:

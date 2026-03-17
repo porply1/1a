@@ -79,6 +79,11 @@ from features.engine   import (
     TargetEncoderTransformer,
     FreqEncoderTransformer,
 )
+from features.selector import NullImportanceSelector
+from post_process.optimizer import (
+    ProbabilityCalibrator,
+    ThresholdOptimizer,
+)
 from models.gbm.lgbm_wrapper      import LGBMModel
 from models.gbm.xgb_wrapper       import XGBModel
 from models.gbm.catboost_wrapper  import CatBoostModel
@@ -186,6 +191,8 @@ def _create_exp_dir(base_dir: str, exp_name: str) -> Path:
     (exp_dir / "oof").mkdir(parents=True, exist_ok=True)
     (exp_dir / "submissions").mkdir(parents=True, exist_ok=True)
     (exp_dir / "importance").mkdir(parents=True, exist_ok=True)
+    (exp_dir / "feature_selection").mkdir(parents=True, exist_ok=True)
+    (exp_dir / "post_process").mkdir(parents=True, exist_ok=True)
     return exp_dir
 
 
@@ -472,6 +479,9 @@ class TrainPipeline:
         # ── Step 3.5: 特征工程后二阶对抗验证 ─────────────────────────
         self._step_adversarial_validation_post_fe(X_train, X_test)
 
+        # ── Step 3.7: Null Importance 特征筛选（可选）────────────────
+        X_train, X_test = self._step_feature_selection(X_train, y, X_test)
+
         # ── Step 4: 构建指标 ───────────────────────────────────────────
         primary_metric, all_metrics = self._build_metrics()
 
@@ -488,6 +498,9 @@ class TrainPipeline:
             cv_results[name] = result
             model_names.append(name)
             self._save_model_artifacts(name, result)
+
+        # ── Step 5.5: 后处理（概率校准 + 阈值优化，可选）──────────────
+        cv_results = self._step_post_process(cv_results, y)
 
         # ── Step 6: Stacking 集成 ──────────────────────────────────────
         final_pred = self._step_ensemble(
@@ -786,6 +799,296 @@ class TrainPipeline:
             f"耗时 {elapsed:.1f}s"
         )
         return X_train, X_test
+
+    # ------------------------------------------------------------------
+    # Step 3.7: Null Importance 特征筛选（可选，在特征工程后、训练前）
+    # ------------------------------------------------------------------
+
+    def _step_feature_selection(
+        self,
+        X_train: pd.DataFrame,
+        y:       pd.Series,
+        X_test:  Optional[pd.DataFrame],
+    ) -> tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+        """
+        Null Importance 置换检验特征筛选。
+
+        配置开关：feature_selection.enable=true
+        执行时机：特征工程结束后、CV 训练开始前。
+        产出归档：{exp_dir}/feature_selection/
+          - selected_features.json  : 保留特征名列表 + 统计摘要
+          - null_importance_scores.csv : 每个特征的诊断分数
+        """
+        fs_cfg = self.cfg.get("feature_selection", {})
+        if not fs_cfg.get("enable", False):
+            return X_train, X_test
+
+        self._banner("Step 3.7  Null Importance 特征筛选")
+        t0   = time.perf_counter()
+        seed = fs_cfg.get("random_state") or self.cfg["experiment"].get("seed", 42)
+
+        # task: null → 继承 experiment.task
+        task = fs_cfg.get("task") or self.cfg["experiment"]["task"]
+        # 三值映射（multiclass 直接透传，其余不变）
+        task = task if task in ("binary", "multiclass", "regression") else "binary"
+
+        sel = NullImportanceSelector(
+            n_iterations         = int(fs_cfg.get("n_iterations", 80)),
+            percentile_threshold = float(fs_cfg.get("percentile_threshold", 75.0)),
+            task                 = task,
+            max_samples          = fs_cfg.get("max_samples"),
+            gain_threshold       = float(fs_cfg.get("gain_threshold", 0.0)),
+            random_state         = int(seed),
+            verbose              = True,
+        )
+
+        # Inf → NaN 预处理（不改变原 DataFrame，只做 fit 用）
+        X_clean = X_train.replace([np.inf, -np.inf], np.nan)
+        sel.fit(X_clean, y)
+
+        selected = sel.selected_features_
+        n_orig   = X_train.shape[1]
+        n_sel    = len(selected)
+
+        # ── 持久化产物 ──────────────────────────────────────────────
+        fs_dir = self.exp_dir / "feature_selection"
+
+        # 1. 保留特征名单（JSON）
+        json.dump(
+            {
+                "n_original":       n_orig,
+                "n_selected":       n_sel,
+                "drop_ratio":       round(1 - n_sel / max(n_orig, 1), 4),
+                "selected_features": selected,
+                "dropped_features": [
+                    c for c in X_train.columns if c not in selected
+                ],
+                "selector_params": {
+                    "n_iterations":         int(fs_cfg.get("n_iterations", 80)),
+                    "percentile_threshold": float(fs_cfg.get("percentile_threshold", 75.0)),
+                    "task":                 task,
+                    "max_samples":          fs_cfg.get("max_samples"),
+                    "gain_threshold":       float(fs_cfg.get("gain_threshold", 0.0)),
+                },
+            },
+            open(fs_dir / "selected_features.json", "w", encoding="utf-8"),
+            ensure_ascii=False,
+            indent=2,
+        )
+
+        # 2. 特征分数诊断表（CSV）
+        sel.get_scores().to_csv(
+            fs_dir / "null_importance_scores.csv", index=False
+        )
+
+        # 3. 可选：重要性条形图（matplotlib 不可用时静默跳过）
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            scores_df = sel.get_scores()
+            top = scores_df.head(40)
+            fig, ax = plt.subplots(figsize=(10, max(6, len(top) * 0.28)))
+            colors = ["#4C72B0" if row["selected"] else "#DD8452"
+                      for _, row in top.iterrows()]
+            ax.barh(
+                top["feature"][::-1],
+                top["real_importance"][::-1],
+                color=colors[::-1],
+            )
+            ax.set_xlabel("Real Importance (gain)")
+            ax.set_title(
+                f"Null Importance — Top-40  "
+                f"[蓝=保留 {n_sel}  橙=丢弃 {n_orig - n_sel}]"
+            )
+            plt.tight_layout()
+            fig.savefig(fs_dir / "null_importance_plot.png", dpi=120)
+            plt.close(fig)
+        except Exception:
+            pass
+
+        # ── 应用筛选 ──────────────────────────────────────────────
+        keep = [c for c in selected if c in X_train.columns]
+        X_train_out = X_train[keep]
+        X_test_out  = X_test[keep] if X_test is not None else None
+
+        elapsed = time.perf_counter() - t0
+        self.report["feature_selection"] = {
+            "n_original":     n_orig,
+            "n_selected":     n_sel,
+            "drop_ratio":     round(1 - n_sel / max(n_orig, 1), 4),
+            "timing_s":       round(elapsed, 1),
+        }
+        self.report["timing"]["feature_selection"] = round(elapsed, 1)
+        self.logger.info(
+            f"特征筛选完成 | {n_orig} → {n_sel} 特征 "
+            f"(丢弃 {n_orig - n_sel}) | 耗时 {elapsed:.1f}s"
+        )
+        return X_train_out, X_test_out
+
+    # ------------------------------------------------------------------
+    # Step 5.5: 后处理（概率校准 + 阈值优化，可选）
+    # ------------------------------------------------------------------
+
+    def _step_post_process(
+        self,
+        cv_results: dict,
+        y:          pd.Series,
+    ) -> dict:
+        """
+        对每个模型的 OOF / 测试集预测进行后处理：
+          - ProbabilityCalibrator : Isotonic / Platt 概率校准
+          - ThresholdOptimizer    : Optuna 搜索最优决策阈值（binary 任务）
+
+        执行时机：所有模型 CV 训练完成后、Stacking 集成之前。
+        注意事项：
+          - oof_predictions 不被修改（保留原值供 Stacking 使用，
+            防止元学习器在已校准空间上再次学习导致信息损失）
+          - test_predictions 如 apply_to_test=True 则替换为校准后的值
+          - 所有参数和报告自动归档到 {exp_dir}/post_process/
+
+        产出归档：{exp_dir}/post_process/{model_name}/
+          - calibrator.pkl         : 已拟合的校准器（可用于线上服务）
+          - threshold.json         : 最优阈值 + OOF 指标
+          - calibration_report.json: Brier/LogLoss 前后对比
+        """
+        pp_cfg = self.cfg.get("post_process", {})
+        if not pp_cfg.get("enable", False):
+            return cv_results
+
+        self._banner("Step 5.5  后处理（概率校准 + 阈值优化）")
+
+        import pickle
+
+        task          = self.cfg["experiment"]["task"]
+        apply_to_test = pp_cfg.get("apply_to_test", True)
+        cal_cfg       = pp_cfg.get("calibration", {})
+        thr_cfg       = pp_cfg.get("threshold", {})
+        pp_dir        = self.exp_dir / "post_process"
+        y_arr         = y.values if hasattr(y, "values") else np.asarray(y)
+
+        self.report["post_process"] = {}
+
+        for model_name, result in cv_results.items():
+            model_pp_dir = pp_dir / model_name
+            model_pp_dir.mkdir(parents=True, exist_ok=True)
+
+            oof_orig  = result.oof_predictions.copy()
+            test_orig = (result.test_predictions.copy()
+                         if result.test_predictions is not None else None)
+
+            cal_oof  = oof_orig.copy()
+            cal_test = test_orig.copy() if test_orig is not None else None
+
+            model_report: dict = {
+                "model":               model_name,
+                "task":                task,
+                "calibration_method":  "none",
+                "best_threshold":      0.5,
+                "best_threshold_score": float("nan"),
+                "threshold_metric":    "f1",
+            }
+
+            # ── 概率校准 ────────────────────────────────────────────
+            if cal_cfg.get("enable", True) and task in ("binary", "multiclass"):
+                cal = ProbabilityCalibrator(
+                    method       = cal_cfg.get("method", "isotonic"),
+                    n_folds      = int(cal_cfg.get("n_folds", 5)),
+                    verbose      = True,
+                )
+                try:
+                    cal_oof = cal.fit_transform(y_arr, oof_orig)
+                    if apply_to_test and cal_test is not None:
+                        cal_test = cal.transform(cal_test)
+
+                    # 持久化校准器
+                    with open(model_pp_dir / "calibrator.pkl", "wb") as fh:
+                        pickle.dump(cal, fh)
+
+                    model_report["calibration_method"] = cal_cfg.get("method", "isotonic")
+                    model_report["brier_before"] = float(
+                        np.mean((oof_orig - y_arr) ** 2)
+                    )
+                    model_report["brier_after"] = float(
+                        np.mean((cal_oof - y_arr) ** 2)
+                    )
+                    model_report["brier_improvement"] = round(
+                        model_report["brier_before"] - model_report["brier_after"], 6
+                    )
+                    self.logger.info(
+                        f"  [{model_name}] 校准完成 | "
+                        f"Brier: {model_report['brier_before']:.5f} → "
+                        f"{model_report['brier_after']:.5f} "
+                        f"(Δ={-model_report['brier_improvement']:+.5f})"
+                    )
+                except Exception as exc:
+                    warnings.warn(
+                        f"[{model_name}] 概率校准失败（{exc}），使用原始预测。"
+                    )
+
+            # ── 阈值优化（仅 binary）────────────────────────────────
+            if thr_cfg.get("enable", True) and task == "binary":
+                thr = ThresholdOptimizer(
+                    metric       = thr_cfg.get("metric", "f1"),
+                    beta         = float(thr_cfg.get("beta", 1.0)),
+                    n_trials     = int(thr_cfg.get("n_trials", 300)),
+                    search_range = tuple(thr_cfg.get("search_range", [0.01, 0.99])),
+                    verbose      = True,
+                )
+                try:
+                    thr.fit(y_arr, cal_oof)
+                    model_report["best_threshold"]       = float(thr.best_threshold_)
+                    model_report["best_threshold_score"] = float(thr.best_score_)
+                    model_report["threshold_metric"]     = str(thr_cfg.get("metric", "f1"))
+
+                    # 持久化阈值
+                    json.dump(
+                        {
+                            "best_threshold":       float(thr.best_threshold_),
+                            "best_score":           float(thr.best_score_),
+                            "metric":               str(thr_cfg.get("metric", "f1")),
+                            "default_threshold":    0.5,
+                            "calibration_method":   model_report["calibration_method"],
+                        },
+                        open(model_pp_dir / "threshold.json", "w", encoding="utf-8"),
+                        indent=2,
+                    )
+                    self.logger.info(
+                        f"  [{model_name}] 阈值优化完成 | "
+                        f"最优阈值={thr.best_threshold_:.4f} | "
+                        f"{thr_cfg.get('metric','f1')}={thr.best_score_:.5f}"
+                    )
+                except Exception as exc:
+                    warnings.warn(
+                        f"[{model_name}] 阈值优化失败（{exc}），使用默认阈值 0.5。"
+                    )
+
+            # ── 持久化校准报告 ───────────────────────────────────────
+            json.dump(
+                model_report,
+                open(model_pp_dir / "calibration_report.json", "w", encoding="utf-8"),
+                indent=2,
+                default=str,
+            )
+
+            # ── 保存校准后的 OOF（独立存储，不覆盖原始 OOF）────────
+            np.save(
+                str(self.exp_dir / "oof" / f"{model_name}_oof_calibrated.npy"),
+                cal_oof,
+            )
+
+            # ── 更新 test_predictions（用于最终提交）────────────────
+            # oof_predictions 保持不变，供 Stacking 元学习器使用
+            if apply_to_test and cal_test is not None and result.test_predictions is not None:
+                result.test_predictions[:] = cal_test
+                self.logger.info(
+                    f"  [{model_name}] 测试集预测已替换为校准后的概率"
+                )
+
+            self.report["post_process"][model_name] = model_report
+
+        return cv_results
 
     # ------------------------------------------------------------------
     # Step 5: 单模型训练（含可选调参）
@@ -1103,9 +1406,22 @@ def _dry_run(config_path: str) -> None:
     tfs = [t['type'] for t in feat_cfg.get("transformers", []) if t.get("enabled", True)]
     print(f"  特征变换器 : {tfs}")
 
+    fs_cfg = cfg.get("feature_selection", {})
+    print(f"  特征筛选   : {'启用' if fs_cfg.get('enable') else '禁用'}"
+          + (f" (iterations={fs_cfg.get('n_iterations',80)}, "
+             f"pct={fs_cfg.get('percentile_threshold',75.0)})"
+             if fs_cfg.get("enable") else ""))
+
     tune_cfg = cfg.get("tuning", {})
     print(f"  Optuna 调参: {'启用' if tune_cfg.get('enable') else '禁用'}")
     print(f"  Stacking   : {'启用' if cfg.get('ensemble', {}).get('enable', True) else '禁用'}")
+
+    pp_cfg = cfg.get("post_process", {})
+    print(f"  后处理     : {'启用' if pp_cfg.get('enable') else '禁用'}"
+          + (f" (校准={pp_cfg.get('calibration',{}).get('method','isotonic')}, "
+             f"阈值优化={pp_cfg.get('threshold',{}).get('enable',True)})"
+             if pp_cfg.get("enable") else ""))
+
     print(f"\n[dry-run] 配置合法，可以正式运行。")
 
 
